@@ -1,0 +1,55 @@
+{
+  "region": "ca-central-1",
+  "accounts": {
+    "access":   "REPLACE_ACCESS_ACCOUNT_ID",
+    "registry": "REPLACE_REGISTRY_ACCOUNT_ID",
+    "app_c":    "REPLACE_APP_C_ACCOUNT_ID",
+    "app_d":    "REPLACE_APP_D_ACCOUNT_ID"
+  },
+  "access_cell": {
+    "vpc_name":              "zlaf-access",
+    "vpc_cidr":              "100.64.0.0/16",
+    "endpoint_subnet_name":  "zlaf-access-endpoint",
+    "endpoint_subnet_cidr":  "100.64.1.0/24",
+    "peer_subnet_name":      "zlaf-access-peer",
+    "peer_subnet_cidr":      "100.64.2.0/24",
+    "endpoint_sg_name":      "zlaf-sn-endpoint",
+    "peer_sg_name":          "zlaf-routing-peer",
+    "service_network_name":  "zlaf-prod-access",
+    "ram_share_name":        "zlaf-prod-access-share",
+    "peer_iam_role":         "zlaf-routing-peer",
+    "peer_instance_name":    "zlaf-routing-peer",
+    "peer_instance_type":    "t3.micro",
+    "peer_ami_param":        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+    "peer_secret_name":      "zlaf/netbird-setup-key"
+  },
+  "applications": [
+    {
+      "id":       "app-c",
+      "account":  "REPLACE_APP_C_ACCOUNT_ID",
+      "fqdn":     "website.example.ca",
+      "alb_name": "website-internal",
+      "port":     443,
+      "vpc_cidr": "10.0.0.0/16"
+    },
+    {
+      "id":       "app-d",
+      "account":  "REPLACE_APP_D_ACCOUNT_ID",
+      "fqdn":     "payments.example.ca",
+      "alb_name": "payments-internal",
+      "port":     443,
+      "vpc_cidr": "10.0.0.0/16"
+    }
+  ],
+  "netbird": {
+    "management_url": "https://api.netbird.io",
+    "version":        "0.31.0",
+    "group_name":     "zlaf-access",
+    "peer_name":      "zlaf-routing-peer",
+    "dns_domain":     "example.ca"
+  },
+  "versions": {
+    "aws_cli_min": "2.15.0",
+    "netbird":     "0.31.0"
+  }
+}

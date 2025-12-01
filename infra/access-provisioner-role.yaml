@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ZLAF access-account provisioner role.
+  Deploy this stack in the central access (security) account BEFORE
+  submitting declarations. The registry controller assumes this role to
+  create Route 53 private zones associated with the access VPC and to
+  describe the ServiceNetwork-type VPC endpoint.
+
+Parameters:
+  RegistryAccountId:
+    Type: String
+    Description: Registry account ID (the Lambda's home account)
+
+Resources:
+
+  FabricProvisioner:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: zlaf-fabric-provisioner
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${RegistryAccountId}:role/zlaf-registry-controller
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: zlaf-access-provisioner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EndpointDescribe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Sid: SplitViewDns
+                Effect: Allow
+                Action:
+                  - route53:CreateHostedZone
+                  - route53:DeleteHostedZone
+                  - route53:ListHostedZones
+                  - route53:ListHostedZonesByName
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt FabricProvisioner.Arn

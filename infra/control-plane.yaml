@@ -1,0 +1,545 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ZLAF Phase 3 — registry account control plane.
+  Deploy this stack in the registry account.
+  Also deploy infra/app-provisioner-role.yaml in each application account
+  and infra/access-provisioner-role.yaml in the access account before
+  submitting declarations.
+
+Parameters:
+  AppCAccountId:
+    Type: String
+    Description: Account ID for application C
+  AppDAccountId:
+    Type: String
+    Description: Account ID for application D
+  AccessAccountId:
+    Type: String
+    Description: Account ID for the central access (security) account
+  ServiceNetworkArn:
+    Type: String
+    Description: ARN of the Lattice service network owned by the access account
+  AccessVpcId:
+    Type: String
+    Description: Access-account VPC ID (for Route 53 private zone VPC association)
+  EndpointId:
+    Type: String
+    Description: ServiceNetwork-type VPC endpoint ID in the access VPC
+  EpSubnetId:
+    Type: String
+    Description: Endpoint subnet ID (ENI IP fallback when endpoint has no alias DNS)
+  NbPeerId:
+    Type: String
+    Description: NetBird routing peer ID
+  NbManagementUrl:
+    Type: String
+    Default: https://api.netbird.io
+  NbSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager secret ARN in this account containing {"token":"<nb-api-token>"}.
+      Never included in event bodies or committed logs.
+  CodeBucket:
+    Type: String
+    Description: S3 bucket (this account) holding the packaged controller Lambda code
+  CodeKey:
+    Type: String
+    Default: zlaf-controller.zip
+
+Resources:
+
+# ── DynamoDB ──────────────────────────────────────────────────────────────────
+
+  RegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: zlaf-registry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: app_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: app_id
+          KeyType: HASH
+
+# ── EventBridge ───────────────────────────────────────────────────────────────
+
+  RegistryBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: zlaf-registry
+
+  # Enrolled application accounts may put events; nothing else is permitted.
+  # Source filtering (enterprise.application-access) is enforced by the rule pattern.
+  RegistryBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref RegistryBus
+      StatementId: AllowEnrolledAppAccounts
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS:
+            - !Sub arn:aws:iam::${AppCAccountId}:root
+            - !Sub arn:aws:iam::${AppDAccountId}:root
+        Action: events:PutEvents
+        Resource: !GetAtt RegistryBus.Arn
+
+  RegistryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref RegistryBus
+      Name: zlaf-registration-intake
+      EventPattern:
+        source:
+          - enterprise.application-access
+        detail-type:
+          - PrivateApplicationRegistrationRequested
+      State: ENABLED
+      Targets:
+        - Id: IntakeQueue
+          Arn: !GetAtt IntakeQueue.Arn
+
+# ── SQS ───────────────────────────────────────────────────────────────────────
+
+  IntakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: zlaf-registry-intake-dlq
+      MessageRetentionPeriod: 1209600
+
+  IntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: zlaf-registry-intake
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IntakeDLQ.Arn
+        maxReceiveCount: 3
+
+  IntakeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IntakeQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IntakeQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt RegistryRule.Arn
+
+# ── Lambda ────────────────────────────────────────────────────────────────────
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: zlaf-registry-controller
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: zlaf-controller
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub >-
+                  arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:
+                  /aws/lambda/zlaf-registry-controller:*
+              - Sid: Registry
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt RegistryTable.Arn
+              - Sid: StartWorkflow
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+              - Sid: SqsConsume
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IntakeQueue.Arn
+              - Sid: NetBirdSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref NbSecretArn
+              - Sid: AssumeAppProvisioners
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub arn:aws:iam::${AppCAccountId}:role/zlaf-fabric-provisioner
+                  - !Sub arn:aws:iam::${AppDAccountId}:role/zlaf-fabric-provisioner
+              - Sid: AssumeAccessProvisioner
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub arn:aws:iam::${AccessAccountId}:role/zlaf-fabric-provisioner
+
+  ControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: zlaf-registry-controller
+      Runtime: python3.12
+      Handler: controller.handler
+      Role: !GetAtt ControllerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key:    !Ref CodeKey
+      Environment:
+        Variables:
+          TABLE_NAME:          !Ref RegistryTable
+          STATE_MACHINE_ARN:   !Ref StateMachine
+          NB_SECRET_ARN:       !Ref NbSecretArn
+          NB_MGMT_URL:         !Ref NbManagementUrl
+          LAB_REGION:          !Sub ${AWS::Region}
+          ACCESS_VPC_ID:       !Ref AccessVpcId
+          ENDPOINT_ID:         !Ref EndpointId
+          EP_SUBNET_ID:        !Ref EpSubnetId
+          NB_PEER_ID:          !Ref NbPeerId
+          SERVICE_NETWORK_ARN: !Ref ServiceNetworkArn
+          APP_C_ACCOUNT:       !Ref AppCAccountId
+          APP_D_ACCOUNT:       !Ref AppDAccountId
+          ACCESS_ACCOUNT:      !Ref AccessAccountId
+          PROVISIONER_ROLE:    zlaf-fabric-provisioner
+
+  SQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:        !GetAtt IntakeQueue.Arn
+      FunctionName:          !GetAtt ControllerFunction.Arn
+      BatchSize:             1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ReconcileRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: zlaf-reconcile
+      Description: Periodic drift reconciliation for ACTIVE/VERIFYING registry records
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: ReconcileLambda
+          Arn: !GetAtt ControllerFunction.Arn
+
+  ReconcilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ControllerFunction.Arn
+      Action:       lambda:InvokeFunction
+      Principal:    events.amazonaws.com
+      SourceArn:    !GetAtt ReconcileRule.Arn
+
+# ── Step Functions ────────────────────────────────────────────────────────────
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: zlaf-registry-statemachine
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-controller
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ControllerFunction.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: ControllerFunction
+    Properties:
+      StateMachineName: zlaf-publication-workflow
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "ZLAF publication workflow — validate, persist, provision or retire AWS/DNS/ZTNA path",
+            "StartAt": "ValidateDeclaration",
+            "States": {
+              "ValidateDeclaration": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "validate", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "PersistDesiredState",
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "RecordRejection"
+                }]
+              },
+              "PersistDesiredState": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "persist", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "PersistRouter"
+              },
+              "PersistRouter": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.ctx.state_accepted",
+                    "BooleanEquals": false,
+                    "Next": "StaleEvent"
+                  },
+                  {
+                    "Variable": "$.ctx.enabled",
+                    "BooleanEquals": true,
+                    "Next": "EnsurePublication"
+                  }
+                ],
+                "Default": "LoadRecord"
+              },
+              "StaleEvent": { "Type": "Succeed" },
+              "EnsurePublication": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "ensure_publication", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "WaitAssociation"
+              },
+              "WaitAssociation": {
+                "Type": "Wait",
+                "Seconds": 20,
+                "Next": "CheckAssociation"
+              },
+              "CheckAssociation": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "check_association", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "AssociationRouter"
+              },
+              "AssociationRouter": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.ctx.association_ready",
+                    "BooleanEquals": true,
+                    "Next": "EnsureDNS"
+                  },
+                  {
+                    "Variable": "$.ctx.tries",
+                    "NumericGreaterThanEquals": 25,
+                    "Next": "FailAssociation"
+                  }
+                ],
+                "Default": "WaitAssociation"
+              },
+              "EnsureDNS": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "ensure_dns", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "EnsureZTNA"
+              },
+              "EnsureZTNA": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "ensure_ztna", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "MarkVerifying"
+              },
+              "MarkVerifying": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "mark_verifying", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "Done"
+              },
+              "LoadRecord": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "load_record", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "RetireZTNA"
+              },
+              "RetireZTNA": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "retire_ztna", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "WaitPropagation"
+              },
+              "WaitPropagation": {
+                "Type": "Wait",
+                "Seconds": 30,
+                "Next": "RetireDNS"
+              },
+              "RetireDNS": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "retire_dns", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "RetirePublication"
+              },
+              "RetirePublication": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "retire_publication", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "MarkRetired"
+              },
+              "MarkRetired": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": { "task": "mark_retired", "ctx.$": "$.ctx" }
+                },
+                "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+                "ResultPath": "$",
+                "Next": "Done"
+              },
+              "Done": { "Type": "Succeed" },
+              "RecordRejection": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${LambdaArn}",
+                  "Payload": {
+                    "task": "record_rejection",
+                    "ctx.$": "$.ctx",
+                    "error.$": "$.error"
+                  }
+                },
+                "ResultPath": null,
+                "Next": "Rejected"
+              },
+              "Rejected": {
+                "Type": "Fail",
+                "Error": "DeclarationRejected",
+                "Cause": "Source-account or FQDN/backend mismatch; see registry record."
+              },
+              "FailAssociation": {
+                "Type": "Fail",
+                "Error": "AssociationTimeout",
+                "Cause": "Lattice association did not reach ACTIVE within the allowed wait."
+              }
+            }
+          }
+        - LambdaArn: !GetAtt ControllerFunction.Arn
+
+# ── Probe role ────────────────────────────────────────────────────────────────
+# A fixed enrolled EC2 instance outside the access VPC runs scripts/verify.sh
+# using this role. The instance lives in the access account and assumes this
+# role to write verification results back to the registry.
+# Scope: only UpdateItem on the registry table; only the four verification
+# attributes may be modified.
+
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: zlaf-probe
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AccessAccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: zlaf-probe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RecordVerification
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt RegistryTable.Arn
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:Attributes:
+                      - app_id
+                      - lifecycle_state
+                      - verified_at
+                      - verification_result
+
+Outputs:
+  RegistryBusArn:
+    Value: !GetAtt RegistryBus.Arn
+    Description: Supply to scripts/submit.sh as REGISTRY_BUS_ARN
+  RegistryTableName:
+    Value: !Ref RegistryTable
+  StateMachineArn:
+    Value: !Ref StateMachine
+  ControllerFunctionArn:
+    Value: !GetAtt ControllerFunction.Arn
+  ProbeRoleArn:
+    Value: !GetAtt ProbeRole.Arn
+    Description: Assume from the access account to record verification results

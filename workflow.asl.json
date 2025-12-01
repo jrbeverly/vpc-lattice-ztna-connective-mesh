@@ -1,0 +1,275 @@
+{
+  "Comment": "ZLAF publication workflow — validate declaration, persist desired state, provision or retire AWS/DNS/ZTNA path",
+  "StartAt": "ValidateDeclaration",
+  "States": {
+
+    "ValidateDeclaration": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "validate",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "PersistDesiredState",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordRejection"
+        }
+      ]
+    },
+
+    "PersistDesiredState": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "persist",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "PersistRouter"
+    },
+
+    "PersistRouter": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ctx.state_accepted",
+          "BooleanEquals": false,
+          "Next": "StaleEvent"
+        },
+        {
+          "Variable": "$.ctx.enabled",
+          "BooleanEquals": true,
+          "Next": "EnsurePublication"
+        }
+      ],
+      "Default": "LoadRecord"
+    },
+
+    "StaleEvent": {
+      "Type": "Succeed"
+    },
+
+    "EnsurePublication": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "ensure_publication",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "WaitAssociation"
+    },
+
+    "WaitAssociation": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "CheckAssociation"
+    },
+
+    "CheckAssociation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "check_association",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "AssociationRouter"
+    },
+
+    "AssociationRouter": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ctx.association_ready",
+          "BooleanEquals": true,
+          "Next": "EnsureDNS"
+        },
+        {
+          "Variable": "$.ctx.tries",
+          "NumericGreaterThanEquals": 25,
+          "Next": "FailAssociation"
+        }
+      ],
+      "Default": "WaitAssociation"
+    },
+
+    "EnsureDNS": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "ensure_dns",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "EnsureZTNA"
+    },
+
+    "EnsureZTNA": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "ensure_ztna",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "MarkVerifying"
+    },
+
+    "MarkVerifying": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "mark_verifying",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "Done"
+    },
+
+    "LoadRecord": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "load_record",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "RetireZTNA"
+    },
+
+    "RetireZTNA": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "retire_ztna",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "WaitPropagation"
+    },
+
+    "WaitPropagation": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "RetireDNS"
+    },
+
+    "RetireDNS": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "retire_dns",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "RetirePublication"
+    },
+
+    "RetirePublication": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "retire_publication",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "MarkRetired"
+    },
+
+    "MarkRetired": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "mark_retired",
+          "ctx.$": "$.ctx"
+        }
+      },
+      "ResultSelector": { "ctx.$": "$.Payload.ctx" },
+      "ResultPath": "$",
+      "Next": "Done"
+    },
+
+    "Done": {
+      "Type": "Succeed"
+    },
+
+    "RecordRejection": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "CONTROLLER_LAMBDA_ARN",
+        "Payload": {
+          "task": "record_rejection",
+          "ctx.$": "$.ctx",
+          "error.$": "$.error"
+        }
+      },
+      "ResultPath": null,
+      "Next": "Rejected"
+    },
+
+    "Rejected": {
+      "Type": "Fail",
+      "Error":  "DeclarationRejected",
+      "Cause": "Source-account or FQDN/backend mismatch; see registry record."
+    },
+
+    "FailAssociation": {
+      "Type": "Fail",
+      "Error":  "AssociationTimeout",
+      "Cause": "Lattice service-network association did not reach ACTIVE within the allowed wait."
+    }
+
+  }
+}

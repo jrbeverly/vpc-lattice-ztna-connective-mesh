@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ZLAF app-account provisioner role.
+  Deploy this stack in each application account (app-c, app-d) BEFORE
+  submitting declarations. The registry controller assumes this role to
+  create Lattice publication resources and permit the Lattice prefix list
+  on the application ALB security group.
+
+Parameters:
+  RegistryAccountId:
+    Type: String
+    Description: Registry account ID (the Lambda's home account)
+
+Resources:
+
+  FabricProvisioner:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: zlaf-fabric-provisioner
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${RegistryAccountId}:role/zlaf-registry-controller
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: zlaf-app-provisioner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LatticePublication
+                Effect: Allow
+                Action:
+                  - vpc-lattice:CreateTargetGroup
+                  - vpc-lattice:DeleteTargetGroup
+                  - vpc-lattice:GetTargetGroup
+                  - vpc-lattice:ListTargetGroups
+                  - vpc-lattice:RegisterTargets
+                  - vpc-lattice:DeregisterTargets
+                  - vpc-lattice:CreateService
+                  - vpc-lattice:DeleteService
+                  - vpc-lattice:GetService
+                  - vpc-lattice:ListServices
+                  - vpc-lattice:CreateListener
+                  - vpc-lattice:DeleteListener
+                  - vpc-lattice:ListListeners
+                  - vpc-lattice:CreateServiceNetworkServiceAssociation
+                  - vpc-lattice:DeleteServiceNetworkServiceAssociation
+                  - vpc-lattice:GetServiceNetworkServiceAssociation
+                  - vpc-lattice:ListServiceNetworkServiceAssociations
+                Resource: '*'
+              - Sid: AlbSgRule
+                Effect: Allow
+                Action:
+                  - ec2:DescribeManagedPrefixLists
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Sid: AlbDescribe
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeListeners
+                Resource: '*'
+              - Sid: FqdnValidation
+                Effect: Allow
+                Action:
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt FabricProvisioner.Arn

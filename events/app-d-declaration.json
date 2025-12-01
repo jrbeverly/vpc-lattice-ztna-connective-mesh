@@ -1,0 +1,15 @@
+{
+  "source": "enterprise.application-access",
+  "detail-type": "PrivateApplicationRegistrationRequested",
+  "detail": {
+    "app_id":     "app-d",
+    "fqdn":       "payments.example.ca",
+    "account_id": "REPLACE_APP_D_ACCOUNT_ID",
+    "region":     "ca-central-1",
+    "port":       443,
+    "protocol":   "tcp",
+    "environment": "prod",
+    "enabled":    true,
+    "revision":   1
+  }
+}
